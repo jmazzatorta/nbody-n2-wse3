@@ -1,0 +1,871 @@
+// pe.csl
+
+// ===========================================================
+// SECTION 1 — IMPORTS AND PARAMS
+// ===========================================================
+
+param side    : u16;
+param N_LOCAL : u16;
+param N_STEPS : u32;
+param DT_NUM  : u32;
+param DT_DEN  : u32;
+
+param memcpy_params;
+
+param k_parity_even : bool;
+param fwd_in_dir    : direction;   // drainer rx dir for FWD stream
+param fwd_out_dir   : direction;   // emitter tx dir for FWD stream
+param has_fwd_in    : u16;
+param has_fwd_out   : u16;
+param has_bwd_in    : u16;
+param has_bwd_out   : u16;
+
+const cons = @import_module("constants.csl", .{
+    .side    = side,
+    .N_LOCAL = N_LOCAL,
+    .N_STEPS = N_STEPS,
+    .DT_NUM  = DT_NUM,
+    .DT_DEN  = DT_DEN,
+});
+
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const math      = @import_module("<math>");
+const timestamp = @import_module("<time>");
+
+// Color constants.
+const FWD_A = @get_color(3);
+const FWD_B = @get_color(4);
+const BWD_A = @get_color(5);
+const BWD_B = @get_color(6);
+
+const N_LOC        = cons.N_LOCAL;
+const FULL_SIZE    = cons.PARTICLE_FULL_SIZE;
+const COMPACT_SIZE = cons.PARTICLE_COMPACT_SIZE;
+const FORCE_SIZE_C = cons.FORCE_SIZE;
+const CHUNK_SIZE   = cons.CHUNK_SIZE;
+
+// ===========================================================
+// SECTION 2 — STATE VARIABLES
+// ===========================================================
+
+// ----------------- HOST INTERFACE BUFFERS (AoS) -----------------
+export var local_particles = @zeros([N_LOC * FULL_SIZE]f32);
+var local_particles_ptr : [*]f32 = &local_particles;
+
+export var local_forces = @zeros([N_LOC * FORCE_SIZE_C]f32);
+var local_forces_ptr : [*]f32 = &local_forces;
+
+// ----------------- LOCAL PARTICLE STATE — SoA -----------------
+var local_x  = @zeros([N_LOC]f32);
+var local_y  = @zeros([N_LOC]f32);
+var local_z  = @zeros([N_LOC]f32);
+var local_vx = @zeros([N_LOC]f32);
+var local_vy = @zeros([N_LOC]f32);
+var local_vz = @zeros([N_LOC]f32);
+var local_m  = @zeros([N_LOC]f32);
+
+// ----------------- FORCE ACCUMULATORS — ONE SET PER STREAM -----
+// Deterministic reduction: the three partial sums are combined in a
+// fixed order (self, fwd, bwd) inside task_integrate, so the result no
+// longer depends on the FWD/BWD task interleaving chosen by the fabric.
+var lf_x_self = @zeros([N_LOC]f32);
+var lf_y_self = @zeros([N_LOC]f32);
+var lf_z_self = @zeros([N_LOC]f32);
+
+var lf_x_fwd = @zeros([N_LOC]f32);
+var lf_y_fwd = @zeros([N_LOC]f32);
+var lf_z_fwd = @zeros([N_LOC]f32);
+
+var lf_x_bwd = @zeros([N_LOC]f32);
+var lf_y_bwd = @zeros([N_LOC]f32);
+var lf_z_bwd = @zeros([N_LOC]f32);
+
+// Combined force, materialized once per step in task_integrate.
+var lf_x = @zeros([N_LOC]f32);
+var lf_y = @zeros([N_LOC]f32);
+var lf_z = @zeros([N_LOC]f32);
+
+var inv_m = @zeros([N_LOC]f32);
+
+export var done = @zeros([1]u32);
+var done_ptr : [*]u32 = &done;
+
+export var n_pred_fwd = @zeros([1]u32);
+var n_pred_fwd_ptr : [*]u32 = &n_pred_fwd;
+export var n_pred_bwd = @zeros([1]u32);
+var n_pred_bwd_ptr : [*]u32 = &n_pred_bwd;
+
+export var time_buf_u16 = @zeros([9 * (N_STEPS + 1)]u16);
+var time_buf_u16_ptr : [*]u16 = &time_buf_u16;
+
+var tsc_start = @zeros([timestamp.tsc_size_words]u16);
+var tsc_self  = @zeros([timestamp.tsc_size_words]u16);
+var tsc_end   = @zeros([timestamp.tsc_size_words]u16);
+
+var rx_chunk_fwd = @zeros([CHUNK_SIZE]f32);
+var rx_chunk_bwd = @zeros([CHUNK_SIZE]f32);
+var own_chunk    = @zeros([CHUNK_SIZE]f32);
+
+var rxs_fwd_x = @zeros([N_LOC]f32);
+var rxs_fwd_y = @zeros([N_LOC]f32);
+var rxs_fwd_z = @zeros([N_LOC]f32);
+var rxs_fwd_m = @zeros([N_LOC]f32);
+
+var rxs_bwd_x = @zeros([N_LOC]f32);
+var rxs_bwd_y = @zeros([N_LOC]f32);
+var rxs_bwd_z = @zeros([N_LOC]f32);
+var rxs_bwd_m = @zeros([N_LOC]f32);
+
+// ----------------- PER-STREAM SCRATCH -----------------
+// The FWD and BWD reduction tasks can interleave arbitrarily, so they
+// must not share temporaries either: a preempted task would otherwise
+// find its scratch overwritten. One private set per stream, plus one
+// for the self pass (which runs outside any task).
+var dx_self     = @zeros([N_LOC]f32);
+var dy_self     = @zeros([N_LOC]f32);
+var dz_self     = @zeros([N_LOC]f32);
+var r2_self     = @zeros([N_LOC]f32);
+var r_self      = @zeros([N_LOC]f32);
+var r3_self     = @zeros([N_LOC]f32);
+var inv_r3_self = @zeros([N_LOC]f32);
+var f_scal_self = @zeros([N_LOC]f32);
+var tmp_self    = @zeros([N_LOC]f32);
+
+var dx_fwd     = @zeros([N_LOC]f32);
+var dy_fwd     = @zeros([N_LOC]f32);
+var dz_fwd     = @zeros([N_LOC]f32);
+var r2_fwd     = @zeros([N_LOC]f32);
+var r_fwd      = @zeros([N_LOC]f32);
+var r3_fwd     = @zeros([N_LOC]f32);
+var inv_r3_fwd = @zeros([N_LOC]f32);
+var f_scal_fwd = @zeros([N_LOC]f32);
+var tmp_fwd    = @zeros([N_LOC]f32);
+
+var dx_bwd     = @zeros([N_LOC]f32);
+var dy_bwd     = @zeros([N_LOC]f32);
+var dz_bwd     = @zeros([N_LOC]f32);
+var r2_bwd     = @zeros([N_LOC]f32);
+var r_bwd      = @zeros([N_LOC]f32);
+var r3_bwd     = @zeros([N_LOC]f32);
+var inv_r3_bwd = @zeros([N_LOC]f32);
+var f_scal_bwd = @zeros([N_LOC]f32);
+var tmp_bwd    = @zeros([N_LOC]f32);
+
+var ax = @zeros([N_LOC]f32);
+var ay = @zeros([N_LOC]f32);
+var az = @zeros([N_LOC]f32);
+
+var fwd_drains_done     : u32 = 0;
+var fwd_drains_launched : u32 = 0;
+var fwd_emits_done      : u32 = 0;
+var fwd_emits_total     : u32 = 0;
+
+var bwd_drains_done     : u32 = 0;
+var bwd_drains_launched : u32 = 0;
+var bwd_emits_done      : u32 = 0;
+var bwd_emits_total     : u32 = 0;
+
+var finalize_triggered : u32 = 0;
+var current_step       : u32 = 0;
+
+// ===========================================================
+// SECTION 3 — DSDs
+// ===========================================================
+
+const rx_fwd_mem_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{CHUNK_SIZE} -> rx_chunk_fwd[i]
+});
+const rx_bwd_mem_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{CHUNK_SIZE} -> rx_chunk_bwd[i]
+});
+const own_chunk_mem_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{CHUNK_SIZE} -> own_chunk[i]
+});
+
+// 8 fabric DSDs, one per (stream, color) pair.
+const fwd_in_dsd_A = @get_dsd(fabin_dsd, .{ .extent = CHUNK_SIZE, .input_queue = cons.iq_FWD_A });
+const fwd_in_dsd_B = @get_dsd(fabin_dsd, .{ .extent = CHUNK_SIZE, .input_queue = cons.iq_FWD_B });
+const bwd_in_dsd_A = @get_dsd(fabin_dsd, .{ .extent = CHUNK_SIZE, .input_queue = cons.iq_BWD_A });
+const bwd_in_dsd_B = @get_dsd(fabin_dsd, .{ .extent = CHUNK_SIZE, .input_queue = cons.iq_BWD_B });
+
+const fwd_out_dsd_A = @get_dsd(fabout_dsd, .{ .extent = CHUNK_SIZE, .output_queue = cons.oq_FWD_A });
+const fwd_out_dsd_B = @get_dsd(fabout_dsd, .{ .extent = CHUNK_SIZE, .output_queue = cons.oq_FWD_B });
+const bwd_out_dsd_A = @get_dsd(fabout_dsd, .{ .extent = CHUNK_SIZE, .output_queue = cons.oq_BWD_A });
+const bwd_out_dsd_B = @get_dsd(fabout_dsd, .{ .extent = CHUNK_SIZE, .output_queue = cons.oq_BWD_B });
+
+const dsd_local_x  = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> local_x[i]  });
+const dsd_local_y  = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> local_y[i]  });
+const dsd_local_z  = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> local_z[i]  });
+const dsd_local_vx = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> local_vx[i] });
+const dsd_local_vy = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> local_vy[i] });
+const dsd_local_vz = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> local_vz[i] });
+const dsd_local_m  = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> local_m[i]  });
+
+// Combined force DSDs.
+const dsd_fx = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_x[i] });
+const dsd_fy = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_y[i] });
+const dsd_fz = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_z[i] });
+
+// Per-stream partial force DSDs.
+const dsd_fx_self = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_x_self[i] });
+const dsd_fy_self = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_y_self[i] });
+const dsd_fz_self = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_z_self[i] });
+
+const dsd_fx_fwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_x_fwd[i] });
+const dsd_fy_fwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_y_fwd[i] });
+const dsd_fz_fwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_z_fwd[i] });
+
+const dsd_fx_bwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_x_bwd[i] });
+const dsd_fy_bwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_y_bwd[i] });
+const dsd_fz_bwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> lf_z_bwd[i] });
+
+const dsd_inv_m = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> inv_m[i] });
+
+const dsd_rxs_fwd_x = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> rxs_fwd_x[i] });
+const dsd_rxs_fwd_y = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> rxs_fwd_y[i] });
+const dsd_rxs_fwd_z = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> rxs_fwd_z[i] });
+const dsd_rxs_fwd_m = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> rxs_fwd_m[i] });
+
+const dsd_rxs_bwd_x = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> rxs_bwd_x[i] });
+const dsd_rxs_bwd_y = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> rxs_bwd_y[i] });
+const dsd_rxs_bwd_z = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> rxs_bwd_z[i] });
+const dsd_rxs_bwd_m = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> rxs_bwd_m[i] });
+
+// Per-stream scratch DSDs.
+const dsd_dx_self     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> dx_self[i]     });
+const dsd_dy_self     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> dy_self[i]     });
+const dsd_dz_self     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> dz_self[i]     });
+const dsd_r2_self     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> r2_self[i]     });
+const dsd_r_self      = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> r_self[i]      });
+const dsd_r3_self     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> r3_self[i]     });
+const dsd_inv_r3_self = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> inv_r3_self[i] });
+const dsd_f_scal_self = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> f_scal_self[i] });
+const dsd_tmp_self    = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> tmp_self[i]    });
+
+const dsd_dx_fwd     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> dx_fwd[i]     });
+const dsd_dy_fwd     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> dy_fwd[i]     });
+const dsd_dz_fwd     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> dz_fwd[i]     });
+const dsd_r2_fwd     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> r2_fwd[i]     });
+const dsd_r_fwd      = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> r_fwd[i]      });
+const dsd_r3_fwd     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> r3_fwd[i]     });
+const dsd_inv_r3_fwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> inv_r3_fwd[i] });
+const dsd_f_scal_fwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> f_scal_fwd[i] });
+const dsd_tmp_fwd    = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> tmp_fwd[i]    });
+
+const dsd_dx_bwd     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> dx_bwd[i]     });
+const dsd_dy_bwd     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> dy_bwd[i]     });
+const dsd_dz_bwd     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> dz_bwd[i]     });
+const dsd_r2_bwd     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> r2_bwd[i]     });
+const dsd_r_bwd      = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> r_bwd[i]      });
+const dsd_r3_bwd     = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> r3_bwd[i]     });
+const dsd_inv_r3_bwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> inv_r3_bwd[i] });
+const dsd_f_scal_bwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> f_scal_bwd[i] });
+const dsd_tmp_bwd    = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> tmp_bwd[i]    });
+
+const dsd_ax = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> ax[i] });
+const dsd_ay = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> ay[i] });
+const dsd_az = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{N_LOC} -> az[i] });
+
+// ===========================================================
+// SECTION 4 — HELPER FUNCTIONS
+// ===========================================================
+
+fn reciprocal_f32(x: f32) f32 {
+    return 1.0 / x;
+}
+
+fn splat_local_aos_to_soa() void {
+    for (@range(u16, N_LOC)) |i| {
+        local_x[i]  = local_particles[i * FULL_SIZE + 0];
+        local_y[i]  = local_particles[i * FULL_SIZE + 1];
+        local_z[i]  = local_particles[i * FULL_SIZE + 2];
+        local_vx[i] = local_particles[i * FULL_SIZE + 3];
+        local_vy[i] = local_particles[i * FULL_SIZE + 4];
+        local_vz[i] = local_particles[i * FULL_SIZE + 5];
+        local_m[i]  = local_particles[i * FULL_SIZE + 6];
+        inv_m[i]    = 1.0 / local_m[i];
+    }
+}
+
+fn splat_local_soa_to_aos() void {
+    for (@range(u16, N_LOC)) |i| {
+        local_particles[i * FULL_SIZE + 0] = local_x[i];
+        local_particles[i * FULL_SIZE + 1] = local_y[i];
+        local_particles[i * FULL_SIZE + 2] = local_z[i];
+        local_particles[i * FULL_SIZE + 3] = local_vx[i];
+        local_particles[i * FULL_SIZE + 4] = local_vy[i];
+        local_particles[i * FULL_SIZE + 5] = local_vz[i];
+        local_particles[i * FULL_SIZE + 6] = local_m[i];
+
+        local_forces[i * FORCE_SIZE_C + 0] = lf_x[i];
+        local_forces[i * FORCE_SIZE_C + 1] = lf_y[i];
+        local_forces[i * FORCE_SIZE_C + 2] = lf_z[i];
+    }
+}
+
+fn pack_own_chunk_from_soa() void {
+    for (@range(u16, N_LOC)) |i| {
+        own_chunk[i * COMPACT_SIZE + 0] = local_x[i];
+        own_chunk[i * COMPACT_SIZE + 1] = local_y[i];
+        own_chunk[i * COMPACT_SIZE + 2] = local_z[i];
+        own_chunk[i * COMPACT_SIZE + 3] = local_m[i];
+    }
+}
+
+fn unpack_chunk_aos_to_soa_fwd() void {
+    for (@range(u16, N_LOC)) |i| {
+        rxs_fwd_x[i] = rx_chunk_fwd[i * COMPACT_SIZE + 0];
+        rxs_fwd_y[i] = rx_chunk_fwd[i * COMPACT_SIZE + 1];
+        rxs_fwd_z[i] = rx_chunk_fwd[i * COMPACT_SIZE + 2];
+        rxs_fwd_m[i] = rx_chunk_fwd[i * COMPACT_SIZE + 3];
+    }
+}
+fn unpack_chunk_aos_to_soa_bwd() void {
+    for (@range(u16, N_LOC)) |i| {
+        rxs_bwd_x[i] = rx_chunk_bwd[i * COMPACT_SIZE + 0];
+        rxs_bwd_y[i] = rx_chunk_bwd[i * COMPACT_SIZE + 1];
+        rxs_bwd_z[i] = rx_chunk_bwd[i * COMPACT_SIZE + 2];
+        rxs_bwd_m[i] = rx_chunk_bwd[i * COMPACT_SIZE + 3];
+    }
+}
+
+fn zero_forces_soa() void {
+    @fmovs(dsd_fx_self, 0.0);
+    @fmovs(dsd_fy_self, 0.0);
+    @fmovs(dsd_fz_self, 0.0);
+
+    @fmovs(dsd_fx_fwd, 0.0);
+    @fmovs(dsd_fy_fwd, 0.0);
+    @fmovs(dsd_fz_fwd, 0.0);
+
+    @fmovs(dsd_fx_bwd, 0.0);
+    @fmovs(dsd_fy_bwd, 0.0);
+    @fmovs(dsd_fz_bwd, 0.0);
+}
+
+// ===========================================================
+// SECTION 5 — VECTORIZED COMPUTE
+// ===========================================================
+
+// One copy of the pair kernel per stream. The arithmetic is identical in
+// all three: same operation order, same rounding points, no FMA in the
+// r2 build-up or in the force accumulation. Only the buffers differ, so
+// that concurrent FWD/BWD tasks never share scratch or accumulators.
+
+fn pair_update_self(xj: f32, yj: f32, zj: f32, mj: f32) void {
+    @fmovs(dsd_dx_self, xj);
+    @fmacs(dsd_dx_self, dsd_dx_self, dsd_local_x, -1.0);
+
+    @fmovs(dsd_dy_self, yj);
+    @fmacs(dsd_dy_self, dsd_dy_self, dsd_local_y, -1.0);
+
+    @fmovs(dsd_dz_self, zj);
+    @fmacs(dsd_dz_self, dsd_dz_self, dsd_local_z, -1.0);
+
+    @fmovs(dsd_r2_self, cons.SOFT_EPS_SQ);
+    @fmuls(dsd_tmp_self, dsd_dx_self, dsd_dx_self);
+    @fadds(dsd_r2_self, dsd_r2_self, dsd_tmp_self);
+    @fmuls(dsd_tmp_self, dsd_dy_self, dsd_dy_self);
+    @fadds(dsd_r2_self, dsd_r2_self, dsd_tmp_self);
+    @fmuls(dsd_tmp_self, dsd_dz_self, dsd_dz_self);
+    @fadds(dsd_r2_self, dsd_r2_self, dsd_tmp_self);
+
+    @map(math.sqrt_f32, dsd_r2_self, dsd_r_self);
+
+    @fmuls(dsd_r3_self, dsd_r_self, dsd_r2_self);
+
+    @map(reciprocal_f32, dsd_r3_self, dsd_inv_r3_self);
+
+    @fmuls(dsd_f_scal_self, dsd_local_m, dsd_inv_r3_self);
+
+    const G_mj = cons.G_GRAV * mj;
+    @fmuls(dsd_f_scal_self, dsd_f_scal_self, G_mj);
+
+    @fmuls(dsd_tmp_self, dsd_f_scal_self, dsd_dx_self);
+    @fadds(dsd_fx_self,  dsd_fx_self,     dsd_tmp_self);
+    @fmuls(dsd_tmp_self, dsd_f_scal_self, dsd_dy_self);
+    @fadds(dsd_fy_self,  dsd_fy_self,     dsd_tmp_self);
+    @fmuls(dsd_tmp_self, dsd_f_scal_self, dsd_dz_self);
+    @fadds(dsd_fz_self,  dsd_fz_self,     dsd_tmp_self);
+}
+
+fn pair_update_fwd(xj: f32, yj: f32, zj: f32, mj: f32) void {
+    @fmovs(dsd_dx_fwd, xj);
+    @fmacs(dsd_dx_fwd, dsd_dx_fwd, dsd_local_x, -1.0);
+
+    @fmovs(dsd_dy_fwd, yj);
+    @fmacs(dsd_dy_fwd, dsd_dy_fwd, dsd_local_y, -1.0);
+
+    @fmovs(dsd_dz_fwd, zj);
+    @fmacs(dsd_dz_fwd, dsd_dz_fwd, dsd_local_z, -1.0);
+
+    @fmovs(dsd_r2_fwd, cons.SOFT_EPS_SQ);
+    @fmuls(dsd_tmp_fwd, dsd_dx_fwd, dsd_dx_fwd);
+    @fadds(dsd_r2_fwd, dsd_r2_fwd, dsd_tmp_fwd);
+    @fmuls(dsd_tmp_fwd, dsd_dy_fwd, dsd_dy_fwd);
+    @fadds(dsd_r2_fwd, dsd_r2_fwd, dsd_tmp_fwd);
+    @fmuls(dsd_tmp_fwd, dsd_dz_fwd, dsd_dz_fwd);
+    @fadds(dsd_r2_fwd, dsd_r2_fwd, dsd_tmp_fwd);
+
+    @map(math.sqrt_f32, dsd_r2_fwd, dsd_r_fwd);
+
+    @fmuls(dsd_r3_fwd, dsd_r_fwd, dsd_r2_fwd);
+
+    @map(reciprocal_f32, dsd_r3_fwd, dsd_inv_r3_fwd);
+
+    @fmuls(dsd_f_scal_fwd, dsd_local_m, dsd_inv_r3_fwd);
+
+    const G_mj = cons.G_GRAV * mj;
+    @fmuls(dsd_f_scal_fwd, dsd_f_scal_fwd, G_mj);
+
+    @fmuls(dsd_tmp_fwd, dsd_f_scal_fwd, dsd_dx_fwd);
+    @fadds(dsd_fx_fwd,  dsd_fx_fwd,     dsd_tmp_fwd);
+    @fmuls(dsd_tmp_fwd, dsd_f_scal_fwd, dsd_dy_fwd);
+    @fadds(dsd_fy_fwd,  dsd_fy_fwd,     dsd_tmp_fwd);
+    @fmuls(dsd_tmp_fwd, dsd_f_scal_fwd, dsd_dz_fwd);
+    @fadds(dsd_fz_fwd,  dsd_fz_fwd,     dsd_tmp_fwd);
+}
+
+fn pair_update_bwd(xj: f32, yj: f32, zj: f32, mj: f32) void {
+    @fmovs(dsd_dx_bwd, xj);
+    @fmacs(dsd_dx_bwd, dsd_dx_bwd, dsd_local_x, -1.0);
+
+    @fmovs(dsd_dy_bwd, yj);
+    @fmacs(dsd_dy_bwd, dsd_dy_bwd, dsd_local_y, -1.0);
+
+    @fmovs(dsd_dz_bwd, zj);
+    @fmacs(dsd_dz_bwd, dsd_dz_bwd, dsd_local_z, -1.0);
+
+    @fmovs(dsd_r2_bwd, cons.SOFT_EPS_SQ);
+    @fmuls(dsd_tmp_bwd, dsd_dx_bwd, dsd_dx_bwd);
+    @fadds(dsd_r2_bwd, dsd_r2_bwd, dsd_tmp_bwd);
+    @fmuls(dsd_tmp_bwd, dsd_dy_bwd, dsd_dy_bwd);
+    @fadds(dsd_r2_bwd, dsd_r2_bwd, dsd_tmp_bwd);
+    @fmuls(dsd_tmp_bwd, dsd_dz_bwd, dsd_dz_bwd);
+    @fadds(dsd_r2_bwd, dsd_r2_bwd, dsd_tmp_bwd);
+
+    @map(math.sqrt_f32, dsd_r2_bwd, dsd_r_bwd);
+
+    @fmuls(dsd_r3_bwd, dsd_r_bwd, dsd_r2_bwd);
+
+    @map(reciprocal_f32, dsd_r3_bwd, dsd_inv_r3_bwd);
+
+    @fmuls(dsd_f_scal_bwd, dsd_local_m, dsd_inv_r3_bwd);
+
+    const G_mj = cons.G_GRAV * mj;
+    @fmuls(dsd_f_scal_bwd, dsd_f_scal_bwd, G_mj);
+
+    @fmuls(dsd_tmp_bwd, dsd_f_scal_bwd, dsd_dx_bwd);
+    @fadds(dsd_fx_bwd,  dsd_fx_bwd,     dsd_tmp_bwd);
+    @fmuls(dsd_tmp_bwd, dsd_f_scal_bwd, dsd_dy_bwd);
+    @fadds(dsd_fy_bwd,  dsd_fy_bwd,     dsd_tmp_bwd);
+    @fmuls(dsd_tmp_bwd, dsd_f_scal_bwd, dsd_dz_bwd);
+    @fadds(dsd_fz_bwd,  dsd_fz_bwd,     dsd_tmp_bwd);
+}
+
+fn compute_self_forces_v2() void {
+    zero_forces_soa();
+    for (@range(u16, N_LOC)) |j| {
+        const xj = local_x[j];
+        const yj = local_y[j];
+        const zj = local_z[j];
+        const mj = local_m[j];
+        pair_update_self(xj, yj, zj, mj);
+    }
+}
+
+fn compute_chunk_forces_v2_fwd() void {
+    for (@range(u16, N_LOC)) |j| {
+        const xj = rxs_fwd_x[j];
+        const yj = rxs_fwd_y[j];
+        const zj = rxs_fwd_z[j];
+        const mj = rxs_fwd_m[j];
+        pair_update_fwd(xj, yj, zj, mj);
+    }
+}
+fn compute_chunk_forces_v2_bwd() void {
+    for (@range(u16, N_LOC)) |j| {
+        const xj = rxs_bwd_x[j];
+        const yj = rxs_bwd_y[j];
+        const zj = rxs_bwd_z[j];
+        const mj = rxs_bwd_m[j];
+        pair_update_bwd(xj, yj, zj, mj);
+    }
+}
+
+// Fixed-order combination of the three partial sums. Called once per
+// step, after both streams have finished, so the total is a deterministic
+// function of the input regardless of task interleaving.
+fn combine_forces_soa() void {
+    @fadds(dsd_fx, dsd_fx_self, dsd_fx_fwd);
+    @fadds(dsd_fx, dsd_fx,      dsd_fx_bwd);
+
+    @fadds(dsd_fy, dsd_fy_self, dsd_fy_fwd);
+    @fadds(dsd_fy, dsd_fy,      dsd_fy_bwd);
+
+    @fadds(dsd_fz, dsd_fz_self, dsd_fz_fwd);
+    @fadds(dsd_fz, dsd_fz,      dsd_fz_bwd);
+}
+
+// ===========================================================
+// SECTION 6 — DRAIN / EMIT HELPERS  (runtime DSD selection by parity)
+// ===========================================================
+
+fn launch_drain_fwd() void {
+    if (k_parity_even) {
+        @mov32(rx_fwd_mem_dsd, fwd_in_dsd_B, .{
+            .async    = true,
+            .activate = cons.task_rx_fwd_complete_id,
+        });
+    } else {
+        @mov32(rx_fwd_mem_dsd, fwd_in_dsd_A, .{
+            .async    = true,
+            .activate = cons.task_rx_fwd_complete_id,
+        });
+    }
+    fwd_drains_launched = fwd_drains_launched + 1;
+}
+
+fn launch_drain_bwd() void {
+    if (k_parity_even) {
+        @mov32(rx_bwd_mem_dsd, bwd_in_dsd_A, .{
+            .async    = true,
+            .activate = cons.task_rx_bwd_complete_id,
+        });
+    } else {
+        @mov32(rx_bwd_mem_dsd, bwd_in_dsd_B, .{
+            .async    = true,
+            .activate = cons.task_rx_bwd_complete_id,
+        });
+    }
+    bwd_drains_launched = bwd_drains_launched + 1;
+}
+
+fn launch_reemit_fwd() void {
+    if (k_parity_even) {
+        @mov32(fwd_out_dsd_A, rx_fwd_mem_dsd, .{
+            .async    = true,
+            .activate = cons.task_tx_fwd_complete_id,
+        });
+    } else {
+        @mov32(fwd_out_dsd_B, rx_fwd_mem_dsd, .{
+            .async    = true,
+            .activate = cons.task_tx_fwd_complete_id,
+        });
+    }
+}
+
+fn launch_reemit_bwd() void {
+    if (k_parity_even) {
+        @mov32(bwd_out_dsd_B, rx_bwd_mem_dsd, .{
+            .async    = true,
+            .activate = cons.task_tx_bwd_complete_id,
+        });
+    } else {
+        @mov32(bwd_out_dsd_A, rx_bwd_mem_dsd, .{
+            .async    = true,
+            .activate = cons.task_tx_bwd_complete_id,
+        });
+    }
+}
+
+fn launch_own_emit_fwd() void {
+    if (k_parity_even) {
+        @mov32(fwd_out_dsd_A, own_chunk_mem_dsd, .{
+            .async    = true,
+            .activate = cons.task_tx_fwd_complete_id,
+        });
+    } else {
+        @mov32(fwd_out_dsd_B, own_chunk_mem_dsd, .{
+            .async    = true,
+            .activate = cons.task_tx_fwd_complete_id,
+        });
+    }
+}
+
+fn launch_own_emit_bwd() void {
+    if (k_parity_even) {
+        @mov32(bwd_out_dsd_B, own_chunk_mem_dsd, .{
+            .async    = true,
+            .activate = cons.task_tx_bwd_complete_id,
+        });
+    } else {
+        @mov32(bwd_out_dsd_A, own_chunk_mem_dsd, .{
+            .async    = true,
+            .activate = cons.task_tx_bwd_complete_id,
+        });
+    }
+}
+
+// ===========================================================
+// SECTION 7 — FINALIZE GATE
+// ===========================================================
+
+fn check_finalize() void {
+    if (finalize_triggered != 0) return;
+
+    var fwd_done : bool = true;
+    if (has_fwd_in == 1) {
+        if (fwd_drains_done != n_pred_fwd[0]) { fwd_done = false; }
+    }
+    if (has_fwd_out == 1) {
+        if (fwd_emits_done != fwd_emits_total) { fwd_done = false; }
+    }
+
+    var bwd_done : bool = true;
+    if (has_bwd_in == 1) {
+        if (bwd_drains_done != n_pred_bwd[0]) { bwd_done = false; }
+    }
+    if (has_bwd_out == 1) {
+        if (bwd_emits_done != bwd_emits_total) { bwd_done = false; }
+    }
+
+    if (fwd_done and bwd_done) {
+        finalize_triggered = 1;
+        @activate(cons.task_integrate_id);
+    }
+}
+
+// ===========================================================
+// SECTION 8 — RUNTIME INIT
+// ===========================================================
+
+export fn runtime_init() void {
+    sys_mod.unblock_cmd_stream();
+}
+
+// ===========================================================
+// SECTION 9 — TASKS
+// ===========================================================
+
+task task_bootstrap() void {
+    if (has_fwd_out == 1) {
+        if (has_fwd_in == 1) {
+            fwd_emits_total = n_pred_fwd[0] + 1;
+        } else {
+            fwd_emits_total = 1;
+        }
+    } else {
+        fwd_emits_total = 0;
+    }
+
+    if (has_bwd_out == 1) {
+        if (has_bwd_in == 1) {
+            bwd_emits_total = n_pred_bwd[0] + 1;
+        } else {
+            bwd_emits_total = 1;
+        }
+    } else {
+        bwd_emits_total = 0;
+    }
+
+    if (has_fwd_out == 1) {
+        launch_own_emit_fwd();
+    } else if (has_fwd_in == 1) {
+        launch_drain_fwd();
+    }
+
+    if (has_bwd_out == 1) {
+        launch_own_emit_bwd();
+    } else if (has_bwd_in == 1) {
+        launch_drain_bwd();
+    }
+
+    check_finalize();
+}
+
+task task_rx_fwd_complete() void {
+    fwd_drains_done = fwd_drains_done + 1;
+
+    if (has_fwd_out == 1) {
+        launch_reemit_fwd();
+    }
+
+    unpack_chunk_aos_to_soa_fwd();
+    compute_chunk_forces_v2_fwd();
+
+    if (has_fwd_out == 0) {
+        if (fwd_drains_launched < n_pred_fwd[0]) {
+            launch_drain_fwd();
+        }
+        check_finalize();
+    }
+}
+
+task task_rx_bwd_complete() void {
+    bwd_drains_done = bwd_drains_done + 1;
+
+    if (has_bwd_out == 1) {
+        launch_reemit_bwd();
+    }
+
+    unpack_chunk_aos_to_soa_bwd();
+    compute_chunk_forces_v2_bwd();
+
+    if (has_bwd_out == 0) {
+        if (bwd_drains_launched < n_pred_bwd[0]) {
+            launch_drain_bwd();
+        }
+        check_finalize();
+    }
+}
+
+task task_tx_fwd_complete() void {
+    fwd_emits_done = fwd_emits_done + 1;
+    if (has_fwd_in == 1 and fwd_drains_launched < n_pred_fwd[0]) {
+        launch_drain_fwd();
+    }
+    check_finalize();
+}
+task task_tx_bwd_complete() void {
+    bwd_emits_done = bwd_emits_done + 1;
+    if (has_bwd_in == 1 and bwd_drains_launched < n_pred_bwd[0]) {
+        launch_drain_bwd();
+    }
+    check_finalize();
+}
+
+task task_integrate() void {
+    timestamp.get_timestamp(&tsc_end);
+    store_ts(&tsc_end, ts_slot(current_step, 6));
+
+    combine_forces_soa();
+
+    @fmuls(dsd_ax, dsd_fx, dsd_inv_m);
+    @fmuls(dsd_ay, dsd_fy, dsd_inv_m);
+    @fmuls(dsd_az, dsd_fz, dsd_inv_m);
+
+    if (current_step == @as(u32, N_STEPS)) {
+        @fmacs(dsd_local_vx, dsd_local_vx, dsd_ax, cons.HALF_DT);
+        @fmacs(dsd_local_vy, dsd_local_vy, dsd_ay, cons.HALF_DT);
+        @fmacs(dsd_local_vz, dsd_local_vz, dsd_az, cons.HALF_DT);
+        timestamp.disable_tsc();
+        @activate(cons.task_finalize_id);
+        return;
+    }
+
+    if (current_step == 0) {
+        @fmacs(dsd_local_vx, dsd_local_vx, dsd_ax, -cons.HALF_DT);
+        @fmacs(dsd_local_vy, dsd_local_vy, dsd_ay, -cons.HALF_DT);
+        @fmacs(dsd_local_vz, dsd_local_vz, dsd_az, -cons.HALF_DT);
+    }
+
+    @fmacs(dsd_local_vx, dsd_local_vx, dsd_ax, cons.DT);
+    @fmacs(dsd_local_vy, dsd_local_vy, dsd_ay, cons.DT);
+    @fmacs(dsd_local_vz, dsd_local_vz, dsd_az, cons.DT);
+
+    @fmacs(dsd_local_x,  dsd_local_x,  dsd_local_vx, cons.DT);
+    @fmacs(dsd_local_y,  dsd_local_y,  dsd_local_vy, cons.DT);
+    @fmacs(dsd_local_z,  dsd_local_z,  dsd_local_vz, cons.DT);
+
+    current_step = current_step + 1;
+
+    fwd_drains_done     = 0;
+    fwd_drains_launched = 0;
+    fwd_emits_done      = 0;
+    bwd_drains_done     = 0;
+    bwd_drains_launched = 0;
+    bwd_emits_done      = 0;
+    finalize_triggered  = 0;
+
+    timestamp.get_timestamp(&tsc_start);
+
+    compute_self_forces_v2();
+    pack_own_chunk_from_soa();
+
+    timestamp.get_timestamp(&tsc_self);
+
+    store_ts(&tsc_start, ts_slot(current_step, 0));
+    store_ts(&tsc_self,  ts_slot(current_step, 3));
+
+    @activate(cons.task_bootstrap_id);
+}
+
+task task_finalize() void {
+    splat_local_soa_to_aos();
+    done[0] = 1;
+    sys_mod.unblock_cmd_stream();
+}
+
+// ===========================================================
+// SECTION 10 — TIMING HELPERS
+// ===========================================================
+
+fn store_ts(src: *[3]u16, dst_offset: u32) void {
+    time_buf_u16[dst_offset + 0] = src.*[0];
+    time_buf_u16[dst_offset + 1] = src.*[1];
+    time_buf_u16[dst_offset + 2] = src.*[2];
+}
+fn ts_slot(step: u32, kind: u32) u32 {
+    return step * @as(u32, 9) + kind;
+}
+
+// ===========================================================
+// SECTION 11 — ENTRY POINT
+// ===========================================================
+
+export fn compute_step() void {
+    timestamp.enable_tsc();
+    timestamp.get_timestamp(&tsc_start);
+
+    splat_local_aos_to_soa();
+
+    compute_self_forces_v2();
+    pack_own_chunk_from_soa();
+
+    timestamp.get_timestamp(&tsc_self);
+    store_ts(&tsc_start, ts_slot(0, 0));
+    store_ts(&tsc_self,  ts_slot(0, 3));
+
+    @activate(cons.task_bootstrap_id);
+}
+
+// ===========================================================
+// SECTION 12 — COMPTIME BINDINGS + STATIC ROUTING
+// ===========================================================
+
+comptime {
+    @bind_local_task(task_bootstrap,       cons.task_bootstrap_id);
+    @bind_local_task(task_rx_fwd_complete, cons.task_rx_fwd_complete_id);
+    @bind_local_task(task_rx_bwd_complete, cons.task_rx_bwd_complete_id);
+    @bind_local_task(task_tx_fwd_complete, cons.task_tx_fwd_complete_id);
+    @bind_local_task(task_tx_bwd_complete, cons.task_tx_bwd_complete_id);
+    @bind_local_task(task_integrate,       cons.task_integrate_id);
+    @bind_local_task(task_finalize,        cons.task_finalize_id);
+
+    // ----- STATIC PER-PE ROUTING -----
+    // For k even: FWD_A emits, FWD_B drains, BWD_A drains, BWD_B emits.
+    // For k odd : mirror. Drainer = {rx=<in dir>, tx=RAMP}; emitter = {rx=RAMP, tx=<out dir>}.
+    // BWD directions are the FWD ones swapped: bwd_in=fwd_out_dir, bwd_out=fwd_in_dir.
+    if (k_parity_even) {
+        @set_local_color_config(FWD_A, .{ .routes = .{ .rx = .{ RAMP },        .tx = .{ fwd_out_dir } } });
+        @set_local_color_config(FWD_B, .{ .routes = .{ .rx = .{ fwd_in_dir },  .tx = .{ RAMP } } });
+        @set_local_color_config(BWD_A, .{ .routes = .{ .rx = .{ fwd_out_dir }, .tx = .{ RAMP } } });
+        @set_local_color_config(BWD_B, .{ .routes = .{ .rx = .{ RAMP },        .tx = .{ fwd_in_dir } } });
+    } else {
+        @set_local_color_config(FWD_A, .{ .routes = .{ .rx = .{ fwd_in_dir },  .tx = .{ RAMP } } });
+        @set_local_color_config(FWD_B, .{ .routes = .{ .rx = .{ RAMP },        .tx = .{ fwd_out_dir } } });
+        @set_local_color_config(BWD_A, .{ .routes = .{ .rx = .{ RAMP },        .tx = .{ fwd_in_dir } } });
+        @set_local_color_config(BWD_B, .{ .routes = .{ .rx = .{ fwd_out_dir }, .tx = .{ RAMP } } });
+    }
+
+    if (@is_arch("wse3")) {
+        @initialize_queue(cons.iq_FWD_A, .{ .color = FWD_A });
+        @initialize_queue(cons.iq_FWD_B, .{ .color = FWD_B });
+        @initialize_queue(cons.iq_BWD_A, .{ .color = BWD_A });
+        @initialize_queue(cons.iq_BWD_B, .{ .color = BWD_B });
+        @initialize_queue(cons.oq_FWD_A, .{ .color = FWD_A });
+        @initialize_queue(cons.oq_FWD_B, .{ .color = FWD_B });
+        @initialize_queue(cons.oq_BWD_A, .{ .color = BWD_A });
+        @initialize_queue(cons.oq_BWD_B, .{ .color = BWD_B });
+    }
+
+    @export_symbol(local_particles_ptr, "ptr_local_particles");
+    @export_symbol(local_forces_ptr,    "ptr_local_forces");
+    @export_symbol(done_ptr,            "ptr_done");
+    @export_symbol(n_pred_fwd_ptr,      "ptr_n_pred_fwd");
+    @export_symbol(n_pred_bwd_ptr,      "ptr_n_pred_bwd");
+    @export_symbol(time_buf_u16_ptr,    "ptr_time_buf_u16");
+    @export_symbol(runtime_init);
+    @export_symbol(compute_step);
+}

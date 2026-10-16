@@ -1,0 +1,117 @@
+// layout.csl
+
+param side          : u16;
+param N_LOCAL       : u16;
+param N_STEPS       : u32;
+param DT_NUM        : u32;
+param DT_DEN        : u32;
+
+param MEMCPY_H2D_ID : i16;
+param MEMCPY_D2H_ID : i16;
+
+const memcpy_mod = @import_module("<memcpy/get_params>", .{
+    .width       = side,
+    .height      = side,
+    .MEMCPYH2D_1 = MEMCPY_H2D_ID,
+    .MEMCPYD2H_1 = MEMCPY_D2H_ID,
+});
+
+// ---- comptime geometry helpers (px,py are known here in the layout loop) ----
+
+// Serpentine ring position k.
+fn ring_k(px: u16, py: u16) u32 {
+    const gs : u32 = @as(u32, side);
+    if (py % 2 == 0) {
+        return @as(u32, py) * gs + @as(u32, px);
+    } else {
+        return @as(u32, py) * gs + (gs - 1 - @as(u32, px));
+    }
+}
+
+// Direction from predecessor k-1 (drainer rx direction for the FWD stream).
+fn compute_fwd_in_dir(px: u16, py: u16) direction {
+    const even_row = (py % 2 == 0);
+    if (even_row) {
+        if (px == 0) {            // predecessor is the PE above (row turn)
+            return NORTH;
+        } else {
+            return WEST;
+        }
+    } else {
+        if (px == side - 1) {
+            return NORTH;
+        } else {
+            return EAST;
+        }
+    }
+}
+
+// Direction to successor k+1 (emitter tx direction for the FWD stream).
+fn compute_fwd_out_dir(px: u16, py: u16) direction {
+    const even_row = (py % 2 == 0);
+    if (even_row) {
+        if (px == side - 1) {    // row turn downward
+            return SOUTH;
+        } else {
+            return EAST;
+        }
+    } else {
+        if (px == 0) {
+            return SOUTH;
+        } else {
+            return WEST;
+        }
+    }
+}
+
+layout {
+    @set_rectangle(side, side);
+
+    const gs       : u32 = @as(u32, side);
+    const ring_len : u32 = gs * gs;
+
+    for (@range(u16, side)) |py| {
+        for (@range(u16, side)) |px| {
+
+            const k     : u32 = ring_k(px, py);
+            const k_bwd : u32 = (ring_len - 1) - k;
+
+            const kpar_even : bool = (k % 2 == 0);
+
+            // has_* kept as u16 (0/1) so pe.csl task code needs ZERO edits.
+            const hfi : u16 = if (k     != 0)            1 else 0;
+            const hfo : u16 = if (k     != ring_len - 1) 1 else 0;
+            const hbi : u16 = if (k_bwd != 0)            1 else 0;
+            const hbo : u16 = if (k_bwd != ring_len - 1) 1 else 0;
+
+            @set_tile_code(px, py, "pe.csl", .{
+                .side          = side,
+                .N_LOCAL       = N_LOCAL,
+                .N_STEPS       = N_STEPS,
+                .DT_NUM        = DT_NUM,
+                .DT_DEN        = DT_DEN,
+                .memcpy_params = memcpy_mod.get_params(px),
+
+                // --- categorical per-PE routing info, all comptime ---
+                .k_parity_even = kpar_even,
+                .fwd_in_dir    = compute_fwd_in_dir(px, py),
+                .fwd_out_dir   = compute_fwd_out_dir(px, py),
+                .has_fwd_in    = hfi,
+                .has_fwd_out   = hfo,
+                .has_bwd_in    = hbi,
+                .has_bwd_out   = hbo,
+            });
+        }
+    }
+
+    @export_name("runtime_init", fn()void);
+    @export_name("compute_step", fn()void);
+
+    @export_name("ptr_local_particles", [*]f32, true);
+    @export_name("ptr_local_forces",    [*]f32, true);
+    @export_name("ptr_done",            [*]u32, true);
+    @export_name("ptr_n_pred_fwd",      [*]u32, true);
+    @export_name("ptr_n_pred_bwd",      [*]u32, true);
+    @export_name("ptr_time_buf_u16",    [*]u16, true);
+}
+

@@ -1,0 +1,46 @@
+// constants.csl
+
+param side    : u16;
+param N_LOCAL : u16;
+param N_STEPS : u32;
+param DT_NUM  : u32;
+param DT_DEN  : u32;
+
+const grid_side : u32 = @as(u32, side);
+const DT      : f32 = @as(f32, DT_NUM) / @as(f32, DT_DEN);
+const HALF_DT : f32 = DT * 0.5;
+
+// ----------------- PHYSICS -----------------
+const SOFT_EPS_SQ : f32 = 0.0001;
+const G_GRAV      : f32 = 1.0;
+
+// ----------------- BUFFER LAYOUT -----------------
+const PARTICLE_FULL_SIZE    : u16 = 7;   // [x,y,z,vx,vy,vz,m]
+const PARTICLE_COMPACT_SIZE : u16 = 4;   // [x,y,z,m]
+const FORCE_SIZE : u16 = 3;
+const CHUNK_SIZE : u16 = N_LOCAL * PARTICLE_COMPACT_SIZE;
+
+// ----------------- RING -----------------
+const RING_LENGTH        : u32 = grid_side * grid_side;
+const TOTAL_CHUNKS_TO_RX : u32 = RING_LENGTH - 1;
+
+// ----------------- INPUT / OUTPUT QUEUES -----------------
+const iq_FWD_A : input_queue  = @get_input_queue(2);
+const iq_FWD_B : input_queue  = @get_input_queue(3);
+const iq_BWD_A : input_queue  = @get_input_queue(4);
+const iq_BWD_B : input_queue  = @get_input_queue(5);
+
+const oq_FWD_A : output_queue = @get_output_queue(2);
+const oq_FWD_B : output_queue = @get_output_queue(3);
+const oq_BWD_A : output_queue = @get_output_queue(4);
+const oq_BWD_B : output_queue = @get_output_queue(5);
+
+// ----------------- LOCAL TASK IDs -----------------
+const task_bootstrap_id       : local_task_id = @get_local_task_id(8);
+const task_rx_fwd_complete_id : local_task_id = @get_local_task_id(10);
+const task_tx_fwd_complete_id : local_task_id = @get_local_task_id(11);
+const task_rx_bwd_complete_id : local_task_id = @get_local_task_id(12);
+const task_tx_bwd_complete_id : local_task_id = @get_local_task_id(13);
+const task_finalize_id        : local_task_id = @get_local_task_id(14);
+const task_integrate_id       : local_task_id = @get_local_task_id(15);
+
